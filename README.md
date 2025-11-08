@@ -1,7 +1,3 @@
-# Wi-Fi-Probe-Monitor
-Live Wi-Fi probe request monitor for Debian based Linux. Displays devices, their vendors, and the networks they probe for, highlighting devices open to any AP.
-
-
 # WiFi Probe Monitor
 
 A Bash script for Kali Linux to capture live Wi-Fi probe requests and display them in an organized way.  
