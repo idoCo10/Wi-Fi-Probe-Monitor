@@ -25,3 +25,5 @@ It shows devices, their vendors (via OUI), SSIDs they probe for, and highlights 
 ```bash
 git clone https://github.com/idoCo10/Wi-Fi-Probe-Monitor.git
 cd Wi-Fi-Probe-Monitor
+sudo chmod +x wifi-probe-monitor.sh
+sudo ./wifi-probe-monitor.sh
