@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# version: 1.2, 11/11/2025
+# version: 1.2, 10/11/2025 23:18
+
 
 UN=${SUDO_USER:-$(whoami)}
 targets_path="/home/$UN/Desktop"
@@ -11,6 +12,8 @@ declare -A device_first_seen   # First seen timestamp per device
 declare -A vendor_cache        # OUI cache
 declare -A missing_devices     # devices with missing/wildcard probes
 declare -A missing_first_seen  # first seen time for missing devices
+declare -A device_ssid_counts  # count of how many times device probed each SSID
+declare -A missing_counts      # count of how many times device sent <MISSING> probe
 
 # Colors
 RED=$'\033[1;31m'
@@ -18,6 +21,8 @@ GREEN=$'\033[1;32m'
 ORANGE=$'\033[1;33m'
 BLUE=$'\033[1;34m'
 CYAN=$'\033[1;36m'
+NEON_YELLOW=$'\033[38;5;226m'
+NEON_GREEN=$'\033[38;5;82m'
 RESET=$'\033[0m'
 BOLD=$'\033[1m'
 
@@ -107,33 +112,44 @@ tshark -i "$wifi_adapter" -Y "wlan.fc.type_subtype == 4" -T fields -e frame.time
     ssid_decoded=$(decode_ssid_if_hex "$ssid_raw")
     ssid_decoded=$(echo "$ssid_decoded" | xargs)  # trim spaces
 
-    # Treat empty or null SSIDs as missing
     [[ -z "$ssid_decoded" ]] && ssid_decoded="<MISSING>"
 
     vendor=$(get_vendor "$sa")
 
     if [[ "$ssid_decoded" == "<MISSING>" ]]; then
-        # Only mark as missing if device has no valid APs
+        ((missing_counts["$sa"]++))
         valid_aps="${device_ssids[$sa]//||/ }"
-        valid_aps=$(echo "$valid_aps" | tr -s ' ' | sed 's/  */ /g')
         has_valid=0
         for ap in $valid_aps; do
             [[ -n "$ap" && "$ap" != "1" ]] && has_valid=1 && break
         done
-        [[ $has_valid -eq 0 ]] && missing_devices["$sa"]="$vendor" && [[ -z "${missing_first_seen[$sa]:-}" ]] && missing_first_seen[$sa]="$time"
-    else
-        [[ "$ssid_decoded" == "1" ]] && continue  # skip router APs
-
-        if [[ -z "${device_ssids[$sa]+_}" ]]; then
-            device_ssids["$sa"]="$ssid_decoded"
-        else
-            IFS='||' read -ra existing_array <<< "${device_ssids[$sa]}"
-            skip=0
-            for ex in "${existing_array[@]}"; do
-                [[ "$ex" == "$ssid_decoded" ]] && skip=1 && break
-            done
-            [[ $skip -eq 0 ]] && device_ssids["$sa"]+="||$ssid_decoded"
+        if [[ $has_valid -eq 0 ]]; then
+            missing_devices["$sa"]="$vendor"
+            [[ -z "${missing_first_seen[$sa]:-}" ]] && missing_first_seen[$sa]="$time"
         fi
+    else
+        [[ "$ssid_decoded" == "1" ]] && continue
+        IFS='||' read -ra existing_array <<< "${device_ssids[$sa]:-}"
+        found=0
+        for ex in "${existing_array[@]}"; do
+            if [[ "$ex" == "$ssid_decoded" ]]; then
+                found=1
+                key="${sa}_${ssid_decoded}"
+                ((device_ssid_counts["$key"]++))
+                break
+            fi
+        done
+
+        if [[ $found -eq 0 ]]; then
+            if [[ -z "${device_ssids[$sa]+_}" ]]; then
+                device_ssids["$sa"]="$ssid_decoded"
+            else
+                device_ssids["$sa"]+="||$ssid_decoded"
+            fi
+            key="${sa}_${ssid_decoded}"
+            device_ssid_counts["$key"]=1
+        fi
+
         device_macs["$sa"]="$vendor"
         [[ -z "${device_first_seen[$sa]:-}" ]] && device_first_seen["$sa"]="$time"
         unset missing_devices["$sa"]
@@ -151,13 +167,15 @@ tshark -i "$wifi_adapter" -Y "wlan.fc.type_subtype == 4" -T fields -e frame.time
         vendor="${device_macs[$dev]}"
         first_seen="${device_first_seen[$dev]}"
         echo
-        echo -e "${CYAN}[$first_seen]${RESET}   ${GREEN}$dev${RESET}   |   ${ORANGE}$vendor${RESET}"
+        echo -e "[$first_seen]   ${NEON_GREEN}${BOLD}$dev${RESET}   |   ${ORANGE}$vendor${RESET}"
 
         count=1
         IFS='||' read -ra aps <<< "${device_ssids[$dev]}"
         for ap in "${aps[@]}"; do
             [[ -n "$ap" && "$ap" != "1" ]] || continue
-            printf "             + ${BLUE}AP %d:${RESET} %s\n" "$count" "$ap"
+            key="${dev}_${ap}"
+            hits="${device_ssid_counts[$key]:-1}"
+            printf "             + ${RED}AP %d:${RESET} ${BOLD}%s${RESET}   ${CYAN}(%s)${RESET}\n" "$count" "$ap" "$hits"
             ((count++))
         done
     done
@@ -165,11 +183,12 @@ tshark -i "$wifi_adapter" -Y "wlan.fc.type_subtype == 4" -T fields -e frame.time
     # Missing/open devices
     if [ ${#missing_devices[@]} -gt 0 ]; then
         echo
-        echo -e "${RED}Devices open for any AP:${RESET}"
+        echo -e "${NEON_YELLOW}${BOLD}Devices open for any AP:${RESET}"
         for mac in $(for m in "${!missing_devices[@]}"; do echo "${missing_first_seen[$m]} $m"; done | sort | awk '{print $2}'); do
             [[ -n "${device_ssids[$mac]:-}" ]] && continue
             first_seen="${missing_first_seen[$mac]}"
-            printf "${CYAN}[%s]${RESET}   ${GREEN}%s${RESET}   |   ${ORANGE}%s${RESET}\n" "$first_seen" "$mac" "${missing_devices[$mac]}"
+            hits="${missing_counts[$mac]:-1}"
+            printf "[%s]   ${NEON_GREEN}${BOLD}%s${RESET}   ${CYAN}(${hits})${RESET}   |   ${ORANGE}%s${RESET}\n" "$first_seen" "$mac" "${missing_devices[$mac]}"
         done
     fi
 done
