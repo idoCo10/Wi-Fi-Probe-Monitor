@@ -1,7 +1,9 @@
 # WiFi Probe Monitor
 
-A Bash script for Kali Linux to capture live Wi-Fi probe requests and display them in an organized way.  
-It shows devices, their vendors (via OUI), SSIDs they probe for, and highlights devices open to any network.
+A Bash script for Kali Linux to capture live Wi-Fi probe requests of Devices around you and display them in an organized way.  
+It shows devices, their vendors (via OUI), AP names they probe for, Counter to display how many probe requests made for each.
+The script also attempt to get the APs details (using Airodump-ng) like BSSID, Encryption, Channel and Power.
+We can also see devices that are open to any network (<MISSING> probe).
 
 ## Features
 
@@ -15,8 +17,8 @@ It shows devices, their vendors (via OUI), SSIDs they probe for, and highlights 
 ## Requirements
 
 - Debian based Linux (Kali, Ubuntu..)
-- `tshark` (the script will auto-install it if missing)
-- Wi-Fi adapter in monitor mode (script will switch it automatically)
+- `tshark` and `Airodump-ng` (the script will auto-install it if missing)
+- Wi-Fi adapter able to be in monitor mode (script will switch it automatically)
 
 <img src="probe_scan.png" alt="Probe Scan" width="400">
 
