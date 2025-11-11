@@ -20,7 +20,7 @@ We can also see devices that are open to any network (<MISSING> probe).
 - `tshark` and `Airodump-ng` (the script will auto-install it if missing)
 - Wi-Fi adapter able to be in monitor mode (script will switch it automatically)
 
-<img src="probe_scan.png" alt="Probe Scan" width="550">
+<img src="probe_scan.png" alt="Probe Scan" width="650">
 
 
 ## Installation
