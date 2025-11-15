@@ -41,7 +41,7 @@ CLEANUP_DONE=false
 
 # Check if the script is run as root
 if [ "$EUID" -ne 0 ]; then
-    echo "${RED}Please run this script as root or with sudo.${RESET}"
+    echo -e "${RED}Please run this script as root or with sudo.${RESET}"
     exit 1
 fi
 
