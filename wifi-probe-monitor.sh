@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # version: 2.0, 29/11/2025 04:23
 
+# Fix dnsmasq shifting spaces..
+# ADD Deauth attack
+
+
 UN=${SUDO_USER:-$(whoami)}
 targets_path="/home/$UN/Desktop/wifi-probe-monitor"
 mkdir -p "$targets_path"
