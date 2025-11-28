@@ -1,25 +1,21 @@
 #!/usr/bin/env bash
-# version: 1.8, 13/11/2025 00:35 
+# version: 1.9, 29/11/2025 02:21 
+
 
 UN=${SUDO_USER:-$(whoami)}
-targets_path="/home/$UN/Desktop"
+targets_path="/home/$UN/Desktop/wifi-probe-monitor"
+mkdir -p "$targets_path"
 OUI_FILE="$targets_path/oui.txt"
+AIRODUMP_FILE="$targets_path/airodump_scan.csv"
 
-
-AP_SCAN_TIME=60 # seconds
-
-
-declare -A device_ssids        # APs per device (array-like string separated by ||)
-declare -A device_macs         # Vendor per device
-declare -A device_first_seen   # First seen timestamp per device
-declare -A vendor_cache        # OUI cache
-declare -A missing_devices     # devices with missing/wildcard probes
-declare -A missing_first_seen  # first seen time for missing devices
-declare -A device_ssid_counts  # count of how many times device probed each SSID
-declare -A missing_counts      # count of how many times device sent <MISSING> probe
-declare -A ap_details_cache    # Cache for AP details (MAC, encryption, channel, power)
-declare -A ap_scan_pids        # PIDs of background AP scanning processes
-declare -A pending_ap_scans    # SSIDs that are currently being scanned
+SCRIPT_START_TIME=$(date +'%d/%m/%y %H:%M:%S')
+declare -A device_ssids # APs per device (array-like string separated by ||)
+declare -A device_macs # Vendor per device
+declare -A device_first_seen # First seen timestamp per device
+declare -A vendor_cache # OUI cache
+declare -A device_ssid_counts # count of how many times device probed each SSID
+declare -A ap_details_cache # Cache for AP details (MAC, encryption, channel, power)
+declare -A device_power # Power level per device
 
 # Colors
 RED=$'\033[1;31m'
@@ -38,6 +34,7 @@ BOLD=$'\033[1m'
 WIFI_ADAPTER=""
 ORIGINAL_ADAPTER=""
 CLEANUP_DONE=false
+AIRODUMP_PID=""
 
 # Check if the script is run as root
 if [ "$EUID" -ne 0 ]; then
@@ -54,25 +51,20 @@ cleanup() {
     CLEANUP_DONE=true
     
     echo
-    echo "${BLUE}Cleaning up processes and network interfaces...${RESET}"
+    echo -e "\n${RED}Cleaning up processes and network interfaces...${RESET}"
     
-    # Kill any background AP scanning processes
-    echo "Stopping background AP scanners..."
-    for pid in "${ap_scan_pids[@]}"; do
-        kill "$pid" >/dev/null 2>&1
-    done
-    
-    # Kill any airodump-ng processes
-    echo "Stopping any airodump-ng processes..."
+    # Kill airodump-ng process
+    echo "Stopping airodump-ng process..."
+    if [[ -n "$AIRODUMP_PID" ]]; then
+        kill "$AIRODUMP_PID" >/dev/null 2>&1
+    fi
     pkill -f "airodump-ng" >/dev/null 2>&1
     sleep 1
     pkill -9 -f "airodump-ng" >/dev/null 2>&1
     
-    # Clean up temporary files
+    # Clean up temporary files (but NOT the scan file)
     echo "Cleaning temporary files..."
     rm -f "/tmp/ap_scan_$$"* >/dev/null 2>&1
-    rm -f "/tmp/ap_scan_background_*" >/dev/null 2>&1
-    rm -f "/tmp/ap_result_*_$$" >/dev/null 2>&1
     
     # Stop monitor mode and restore original interface
     if [[ -n "$WIFI_ADAPTER" && "$WIFI_ADAPTER" == *"mon" ]]; then
@@ -102,6 +94,7 @@ check_oui() {
 adapter_config() {
     airmon-ng check kill > /dev/null 2>&1
     adapters=($(iw dev | awk '$1=="Interface"{print $2}'))
+    
     if [[ ${#adapters[@]} -eq 0 ]]; then
         read -p "Enter your WiFi adapter name: " wifi_adapter
         [[ -z "$wifi_adapter" ]] && { echo "${RED}No adapter provided. Exiting.${RESET}"; exit 1; }
@@ -159,247 +152,345 @@ decode_ssid_if_hex() {
 }
 
 install_dependencies() {
-    if ! command -v tshark >/dev/null 2>&1; then
-        echo "tshark not found. Installing..."
-        apt update && apt install -y tshark
-    fi
-    
     if ! command -v airodump-ng >/dev/null 2>&1; then
         echo "airodump-ng not found. Installing..."
         apt update && apt install -y aircrack-ng
     fi
 }
 
-# Background AP scanning function
-get_ap_details_background() {
-    local ssid="$1"
-    local iface="$2"
-    local device_mac="$3"
+start_airodump_scan() {
+    echo "${ORANGE}Starting airodump-ng scan on $WIFI_ADAPTER...${RESET}"
     
-    # Don't start if already scanning or cached
-    [[ -n "${pending_ap_scans[$ssid]}" || -n "${ap_details_cache[$ssid]}" ]] && return
+    # Remove any existing airodump files
+    rm -f "$AIRODUMP_FILE"* >/dev/null 2>&1
     
-    # Mark as pending
-    pending_ap_scans[$ssid]=1
+    # Start airodump-ng in background
+    airodump-ng "$WIFI_ADAPTER" --band abg --ignore-negative-one --output-format csv -w "$AIRODUMP_FILE" >/dev/null 2>&1 &
+    AIRODUMP_PID=$!
     
-    # Run in background
-    (
-        local temp_output="/tmp/ap_scan_background_$$_$RANDOM"
-        local temp_csv="${temp_output}-01.csv"
-        
-        # Clean up any existing files
-        rm -f "${temp_output}"* >/dev/null 2>&1
-        
-        # Start airodump-ng
-        sudo airodump-ng --band abg "$iface" --essid "$ssid" --ignore-negative-one --output-format csv -w "$temp_output" >/dev/null 2>&1 &
-        local airo_pid=$!
-        
-        local bssid="" channel="" encryption="" power=""
-        local max_attempts="$AP_SCAN_TIME"
-        local attempt=0
-        
-        while [ $attempt -lt $max_attempts ]; do
-            if [ -f "$temp_csv" ]; then
-                local ap_line=$(awk -F',' -v target_ssid="$ssid" '
-                NR>1 {
-                    gsub(/^ +| +$/,"",$14)
-                    if($14==target_ssid && $1!="" && $1!~/" "/){
-                        print $1","$4","$6","$9
-                        exit
-                    }
-                }' "$temp_csv" 2>/dev/null)
-                
-                if [ -n "$ap_line" ]; then
-                    IFS=',' read -r bssid channel encryption power <<< "$ap_line"
-                    bssid=$(echo "$bssid" | xargs)
-                    channel=$(echo "$channel" | xargs)
-                    encryption=$(echo "$encryption" | xargs)
-                    power=$(echo "$power" | xargs)
-                    
-                    if [[ -n "$bssid" && "$bssid" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
-                        break
-                    fi
-                fi
-            fi
-            sleep 1
-            ((attempt++))
-        done
-        
-        sudo kill $airo_pid >/dev/null 2>&1
-        wait $airo_pid 2>/dev/null
-        
-        rm -f "${temp_output}"* >/dev/null 2>&1
-        
-        bssid="${bssid:-}"
-        channel="${channel:-}"
-        encryption="${encryption:-}"
-        power="${power:-}"
-        
-        # WRITE RESULTS TO A TEMP FILE INSTEAD OF DIRECTLY TO ARRAY
-        local result_file="/tmp/ap_result_${ssid}_$$"
-        echo "${bssid}|${encryption}|${channel}|${power}" > "$result_file"
-        
-    ) &
+    # Wait for CSV file to be created
+    local max_wait=10
+    local wait_count=0
+    while [[ ! -f "${AIRODUMP_FILE}-01.csv" && $wait_count -lt $max_wait ]]; do
+        sleep 1
+        ((wait_count++))
+    done
     
-    ap_scan_pids["$ssid"]=$!
+    if [[ ! -f "${AIRODUMP_FILE}-01.csv" ]]; then
+        echo "${RED}Failed to start airodump-ng scan${RESET}"
+        exit 1
+    fi
+    
+    echo "${GREEN}Airodump-ng scan started successfully (PID: $AIRODUMP_PID)${RESET}"
 }
 
-# Process completed background scans
-process_completed_scans() {
-    for ssid in "${!ap_scan_pids[@]}"; do
-        local pid="${ap_scan_pids[$ssid]}"
-        if ! kill -0 "$pid" 2>/dev/null; then
-            # Process is done, check for results
-            local result_file="/tmp/ap_result_${ssid}_$$"
-            if [[ -f "$result_file" ]]; then
-                # Read results from file and update cache
-                ap_details_cache["$ssid"]=$(cat "$result_file")
-                rm -f "$result_file"
-            fi
-            # Remove from tracking
-            unset ap_scan_pids["$ssid"]
-            unset pending_ap_scans["$ssid"]
+parse_probe_requests() {
+    local csv_file="${AIRODUMP_FILE}-01.csv"
+    
+    if [[ ! -f "$csv_file" ]]; then
+        return
+    fi
+    
+    # Use process substitution to avoid subshell issues
+    while IFS= read -r line; do
+        # Skip empty lines
+        [[ -z "$line" ]] && continue
+        
+        # Extract fields manually to handle commas in probed ESSIDs
+        station_mac=$(echo "$line" | cut -d',' -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        first_seen=$(echo "$line" | cut -d',' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        power=$(echo "$line" | cut -d',' -f4 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        packets_count=$(echo "$line" | cut -d',' -f5 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        
+        # Get everything from field 7 to the end as probed ESSIDs
+        probed_essids=$(echo "$line" | cut -d',' -f7- | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/,$//')
+        
+        # Skip incomplete records or header
+        [[ -z "$station_mac" || "$station_mac" == "Station MAC" || ! "$station_mac" =~ ":" ]] && continue
+        
+        # Normalize MAC
+        station_mac=$(normalize_mac "$station_mac")
+        
+        # Get vendor
+        vendor=$(get_vendor "$station_mac")
+        
+        # Extract time from first_seen (remove date part)
+        first_seen_time=$(echo "$first_seen" | grep -oP '\d{2}:\d{2}:\d{2}' | head -1)
+        [[ -z "$first_seen_time" ]] && first_seen_time="$(date +%H:%M:%S)"
+        
+        # Only process if we have probed ESSIDs and they are not "(not associated)"
+        if [[ -n "$probed_essids" && "$probed_essids" != "(not associated)" ]]; then
+            # Split multiple ESSIDs by comma and process each one
+            IFS=',' read -ra essid_array <<< "$probed_essids"
+            for essid in "${essid_array[@]}"; do
+                # Clean up each individual ESSID
+                essid_clean=$(echo "$essid" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                [[ -z "$essid_clean" ]] && continue
+                
+                # Decode if hex
+                essid_decoded=$(decode_ssid_if_hex "$essid_clean")
+                
+                # Skip empty or generic probes
+                if [[ -n "$essid_decoded" && "$essid_decoded" != "<MISSING>" && "$essid_decoded" != "Broadcast" && "$essid_decoded" != "(not associated)" ]]; then
+                    # Check if this is a new SSID for this device
+                    IFS='||' read -ra existing_array <<< "${device_ssids[$station_mac]:-}"
+                    found=0
+                    for ex in "${existing_array[@]}"; do
+                        if [[ "$ex" == "$essid_decoded" ]]; then
+                            found=1
+                            key="${station_mac}_${essid_decoded}"
+                            # Update probe count from CSV
+                            device_ssid_counts["$key"]=$packets_count
+                            break
+                        fi
+                    done
+                    
+                    if [[ $found -eq 0 ]]; then
+                        # New SSID for this device
+                        if [[ -z "${device_ssids[$station_mac]+_}" ]]; then
+                            device_ssids["$station_mac"]="$essid_decoded"
+                        else
+                            device_ssids["$station_mac"]+="||$essid_decoded"
+                        fi
+                        key="${station_mac}_${essid_decoded}"
+                        # Store probe count from CSV
+                        device_ssid_counts["$key"]=$packets_count
+                        
+                        # Store device info
+                        device_macs["$station_mac"]="$vendor"
+                        # Store first seen time from CSV
+                        device_first_seen["$station_mac"]="$first_seen_time"
+                        # Store power from CSV
+                        device_power["$station_mac"]="$power"
+                    else
+                        # For existing SSIDs, make sure device info is set
+                        device_macs["$station_mac"]="$vendor"
+                        # Update first seen time if not set
+                        [[ -z "${device_first_seen[$station_mac]:-}" ]] && device_first_seen["$station_mac"]="$first_seen_time"
+                        # Update power if not set
+                        [[ -z "${device_power[$station_mac]:-}" ]] && device_power["$station_mac"]="$power"
+                    fi
+                fi
+            done
+        fi
+    done < <(
+        # Find the line number where the station list starts
+        local station_start_line=$(grep -n "Station MAC" "$csv_file" | cut -d: -f1)
+        
+        if [[ -n "$station_start_line" ]]; then
+            # Output only the station lines (skip header)
+            tail -n +$((station_start_line + 1)) "$csv_file"
+        fi
+    )
+}
+
+update_ap_cache_from_airodump() {
+    local csv_file="${AIRODUMP_FILE}-01.csv"
+    
+    if [[ ! -f "$csv_file" ]]; then
+        return
+    fi
+    
+    # Find the line number where the station list starts
+    local station_start_line=$(grep -n "Station MAC" "$csv_file" | cut -d: -f1)
+    
+    if [[ -z "$station_start_line" ]]; then
+        station_start_line=999999
+    fi
+    
+    # Parse AP section using awk - similar to your working approach
+    awk -F, -v station_line="$station_start_line" '
+    NR >= station_line { exit }
+    /BSSID/ { next }
+    $1 ~ /:/ && $14 != "" {
+        bssid = $1
+        essid = $14
+        channel = $4
+        privacy = $6
+        power = $9
+        
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", bssid)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", essid)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", channel)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", privacy)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", power)
+        
+        if (essid != "") {
+            print essid "|" bssid "|" privacy "|" channel "|" power
+        }
+    }
+    ' "$csv_file" | while IFS='|' read -r essid bssid privacy channel power; do
+        [[ -z "$essid" ]] && continue
+        
+        # Decode if hex
+        essid_decoded=$(decode_ssid_if_hex "$essid")
+        
+        # Update AP cache
+        if [[ -n "$essid_decoded" && "$essid_decoded" != "<MISSING>" ]]; then
+            ap_details_cache["$essid_decoded"]="${bssid}|${privacy}|${channel}|${power}"
         fi
     done
 }
 
 
-# Display function (updated to include AP OUI/vendor)
+
+
+# Display function - shows devices probing for specific APs in table format with AP details
 display_results() {
     clear
-    echo -e "${BOLD}=== Probe Requests Live ===${RESET}"
-
-    # Sort devices by first-seen time (oldest first)
+    echo -e "${ORANGE}======== WiFi Probe Monitor ========${RESET}"
+    echo -e "${BOLD}Start time: $SCRIPT_START_TIME${RESET}\n\n"
+    
+    if [ ${#device_first_seen[@]} -eq 0 ]; then
+        echo -e "${NEON_YELLOW}No devices probing for specific APs detected yet...${RESET}"
+        echo -e "\n\n${CYAN}Press Ctrl+C to stop the scan${RESET}"
+        return
+    fi
+    
+    # Display header with AP details
+    printf "${BOLD}%-3s %-18s %-45s %-8s %-8s %-30s %-18s %-10s %-9s %-11s %-30s${RESET}\n" \
+        "#" "Device" "Device OUI" "Power" "Probes" "AP Name" "MAC" "AP power" "Channel" "Encryption" "AP vendor OUI"
+    echo "-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------"
+    
+    # Sort devices by first-seen time (oldest first) and display with numbers
+    local count=1
     for dev in $(for d in "${!device_first_seen[@]}"; do echo "${device_first_seen[$d]} $d"; done | sort | awk '{print $2}'); do
         vendor="${device_macs[$dev]}"
-        first_seen="${device_first_seen[$dev]}"
-        echo
-        #echo -e "[$first_seen]  ${NEON_GREEN}${BOLD}$dev${RESET}       |  ${ORANGE}$vendor${RESET}"
-        echo -e "${NEON_GREEN}${BOLD}$dev${RESET}  ${ORANGE}$vendor${RESET}"        
-        count=1
+        power="${device_power[$dev]:--}"
+        
         IFS='||' read -ra aps <<< "${device_ssids[$dev]}"
+        
+        # Check if device probes for multiple APs
+        local ap_count=${#aps[@]}
+        
         for ap in "${aps[@]}"; do
             [[ -n "$ap" && "$ap" != "1" ]] || continue
-
             key="${dev}_${ap}"
-            hits="${device_ssid_counts[$key]:-1}"
-
-            # Get AP details from cache
-            if [[ -n "${ap_details_cache[$ap]}" ]]; then
-                IFS='|' read -r ap_mac ap_encryption ap_channel ap_power <<< "${ap_details_cache[$ap]}"
-
-                if [[ -n "$ap_mac$ap_encryption$ap_channel$ap_power" ]]; then
-                    # Normalize and lookup vendor/OUI for the AP BSSID
-                    ap_mac_norm="$(normalize_mac "$ap_mac")"
-                    ap_oui="$(get_vendor "$ap_mac_norm")"
-                    [[ -z "$ap_oui" ]] && ap_oui="Unknown"
-
-                    printf "%19s+ ${RED}AP %d:${RESET}  ${BOLD}%-20s${RESET} ${NEON_PURPLE}${BOLD}(%s)${RESET} \n %26s ${CYAN}BSSID: ${RESET}%-17s  ${CYAN}Enc: ${RESET}%-8s  \n %26s ${CYAN}Ch: ${RESET}%-3s ${CYAN}Pwr: ${RESET}%-4s  ${CYAN}OUI: ${RESET}%s\n" \
-                        "" "$count" "$ap" "$hits" "" "$ap_mac" "$ap_encryption" "" "$ap_channel" "$ap_power" "$ap_oui"
-
-                else
-                    # AP details empty, print queued/scanning status instead
-                    printf "%19s+ ${RED}AP %d:${RESET}  ${BOLD}%-20s${RESET} ${NEON_PURPLE}${BOLD}(%s)${RESET}\n" "" "$count" "$ap" "$hits"
-                fi
+            probe_count="${device_ssid_counts[$key]:-0}"
+            
+            # Search for AP details in the airodump file
+            ap_details=$(get_ap_details "$ap")
+            
+            # Extract AP details
+            ap_mac=$(echo "$ap_details" | cut -d'|' -f1)
+            ap_power=$(echo "$ap_details" | cut -d'|' -f2)
+            ap_channel=$(echo "$ap_details" | cut -d'|' -f3)
+            ap_encryption=$(echo "$ap_details" | cut -d'|' -f4)
+            ap_vendor=$(echo "$ap_details" | cut -d'|' -f5)
+            
+            # Set empty values if AP not found
+            [[ -z "$ap_mac" || "$ap_mac" == "Not Found" ]] && ap_mac=""
+            [[ -z "$ap_power" ]] && ap_power=""
+            [[ -z "$ap_channel" ]] && ap_channel=""
+            [[ -z "$ap_encryption" ]] && ap_encryption=""
+            [[ -z "$ap_vendor" ]] && ap_vendor=""
+            
+            # Color the device MAC in green only if it probes for multiple APs
+            if [[ $ap_count -gt 1 ]]; then
+                printf "%-3s ${NEON_GREEN}%-18s${RESET} %-45s %-8s %-8s %-30s %-18s %-10s %-9s %-11s %-30s\n" \
+                    "${count})" "$dev" "$vendor" "$power" "$probe_count" "$ap" "$ap_mac" "$ap_power" "$ap_channel" "$ap_encryption" "$ap_vendor"
             else
-                # No cache yet
-                printf "%19s+ ${RED}AP %d:${RESET}  ${BOLD}%-20s${RESET} ${NEON_PURPLE}${BOLD}(%s)${RESET}\n" "" "$count" "$ap" "$hits"
+                printf "%-3s %-18s %-45s %-8s %-8s %-30s %-18s %-10s %-9s %-11s %-30s\n" \
+                    "${count})" "$dev" "$vendor" "$power" "$probe_count" "$ap" "$ap_mac" "$ap_power" "$ap_channel" "$ap_encryption" "$ap_vendor"
             fi
+            
             ((count++))
         done
     done
-
-    # Missing/open devices
-    if [ ${#missing_devices[@]} -gt 0 ]; then
-        echo
-        echo -e "\n${NEON_YELLOW}${BOLD}Devices open for any AP:${RESET}"
-        for mac in $(for m in "${!missing_devices[@]}"; do echo "${missing_first_seen[$m]} $m"; done | sort | awk '{print $2}'); do
-            [[ -n "${device_ssids[$mac]:-}" ]] && continue
-            first_seen="${missing_first_seen[$mac]}"
-            hits="${missing_counts[$mac]:-1}"
-            #printf "[%s]  ${NEON_GREEN}${BOLD}%-17s${RESET}  ${NEON_PURPLE}${BOLD}(%s)${RESET}  |  ${ORANGE}%s${RESET}\n" "$first_seen" "$mac" "$hits" "${missing_devices[$mac]}"
-            printf "${NEON_GREEN}${BOLD}%-17s${RESET}  ${NEON_PURPLE}${BOLD}(%s)${RESET}  ${ORANGE}%s${RESET}\n" "$mac" "$hits" "${missing_devices[$mac]}"
-        done
-    fi
-
-    # Show scanning status
-    local scanning_count=${#pending_ap_scans[@]}
+    
+    echo -e "\n\n${CYAN}Press Ctrl+C to stop the scan${RESET}"
 }
+
+# Function to get AP details from airodump file
+get_ap_details() {
+    local ap_essid="$1"
+    local csv_file="${AIRODUMP_FILE}-01.csv"
+    
+    if [[ ! -f "$csv_file" ]]; then
+        echo "||||"
+        return
+    fi
+    
+    # Find the line number where the station list starts (to know where AP section ends)
+    local station_start_line=$(grep -n "Station MAC" "$csv_file" | cut -d: -f1)
+    
+    if [[ -z "$station_start_line" ]]; then
+        station_start_line=999999
+    fi
+    
+    # Search for AP in the AP section of the CSV
+    local ap_line=$(awk -F, -v target_essid="$ap_essid" -v station_line="$station_start_line" '
+    NR >= station_line { exit }
+    /BSSID/ { next }
+    $1 ~ /:/ {
+        # Field 14 is ESSID, but we need to clean it
+        essid = $14
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", essid)
+        gsub(/,$/, "", essid)  # Remove trailing comma if present
+        
+        if (essid == target_essid) {
+            bssid = $1
+            channel = $4
+            encryption = $6
+            power = $9
+            
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", bssid)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", channel)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", encryption)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", power)
+            
+            print bssid "|" power "|" channel "|" encryption
+            exit
+        }
+    }
+    ' "$csv_file")
+    
+    if [[ -n "$ap_line" ]]; then
+        # Extract BSSID from the AP line to get vendor
+        local ap_bssid=$(echo "$ap_line" | cut -d'|' -f1)
+        local ap_vendor=""
+        
+        if [[ -n "$ap_bssid" && "$ap_bssid" != "Not Found" ]]; then
+            # Normalize MAC and get vendor
+            local ap_bssid_norm=$(normalize_mac "$ap_bssid")
+            ap_vendor=$(get_vendor "$ap_bssid_norm")
+            [[ -z "$ap_vendor" ]] && ap_vendor=""
+        else
+            ap_vendor=""
+        fi
+        
+        echo "${ap_line}|${ap_vendor}"
+    else
+        echo "||||"
+    fi
+}
+
 
 
 # Main execution
 check_oui
 install_dependencies
 adapter_config
+start_airodump_scan
 
 clear
-echo "${ORANGE}Starting probe requests monitoring on ${NEON_GREEN}$WIFI_ADAPTER${ORANGE}...${RESET}"
+echo "${ORANGE}Starting probe requests monitoring via airodump-ng on ${NEON_GREEN}$WIFI_ADAPTER${ORANGE}...${RESET}"
+echo "${ORANGE}Airodump-ng PID: $AIRODUMP_PID${RESET}"
+echo "${ORANGE}Output file: ${AIRODUMP_FILE}-01.csv${RESET}"
+echo "${ORANGE}Display will update every 5 seconds${RESET}"
+echo
 
-# Use the original working pipeline
-tshark -i "$WIFI_ADAPTER" -Y "wlan.fc.type_subtype == 4" -T fields -e frame.time -e wlan.sa -e wlan.ta -e wlan.ssid -l 2>/dev/null \
-| while IFS=$'\t' read -r time sa ta ssid_raw; do
-    time=$(echo "$time" | grep -oP '\d{2}:\d{2}:\d{2}')
-    sa=$(normalize_mac "$sa")
-    ssid_decoded=$(decode_ssid_if_hex "$ssid_raw")
-    ssid_decoded=$(echo "$ssid_decoded" | xargs) # trim spaces
-    [[ -z "$ssid_decoded" ]] && ssid_decoded="<MISSING>"
+# Main monitoring loop
+while true; do
+    # Parse probe requests from airodump output
+    parse_probe_requests
     
-    vendor=$(get_vendor "$sa")
+    # Update AP cache from airodump output
+    update_ap_cache_from_airodump
     
-    if [[ "$ssid_decoded" == "<MISSING>" ]]; then
-        ((missing_counts["$sa"]++))
-        valid_aps="${device_ssids[$sa]//||/ }"
-        has_valid=0
-        for ap in $valid_aps; do
-            [[ -n "$ap" && "$ap" != "1" ]] && has_valid=1 && break
-        done
-        
-        if [[ $has_valid -eq 0 ]]; then
-            missing_devices["$sa"]="$vendor"
-            [[ -z "${missing_first_seen[$sa]:-}" ]] && missing_first_seen[$sa]="$time"
-        fi
-    else
-        [[ "$ssid_decoded" == "1" ]] && continue
-        
-        IFS='||' read -ra existing_array <<< "${device_ssids[$sa]:-}"
-        found=0
-        for ex in "${existing_array[@]}"; do
-            if [[ "$ex" == "$ssid_decoded" ]]; then
-                found=1
-                key="${sa}_${ssid_decoded}"
-                ((device_ssid_counts["$key"]++))
-                break
-            fi
-        done
-        
-        if [[ $found -eq 0 ]]; then
-            # New SSID for this device - trigger background AP scanning
-            get_ap_details_background "$ssid_decoded" "$WIFI_ADAPTER" "$sa"
-            
-            if [[ -z "${device_ssids[$sa]+_}" ]]; then
-                device_ssids["$sa"]="$ssid_decoded"
-            else
-                device_ssids["$sa"]+="||$ssid_decoded"
-            fi
-            key="${sa}_${ssid_decoded}"
-            device_ssid_counts["$key"]=1
-            
-            # CRITICAL: Store device info immediately like the working script does
-            device_macs["$sa"]="$vendor"
-            [[ -z "${device_first_seen[$sa]:-}" ]] && device_first_seen["$sa"]="$time"
-        else
-            # For existing SSIDs, still make sure device info is set
-            device_macs["$sa"]="$vendor"
-            [[ -z "${device_first_seen[$sa]:-}" ]] && device_first_seen["$sa"]="$time"
-        fi
-        
-        unset missing_devices["$sa"]
-        unset missing_first_seen["$sa"]
-    fi
-    
-    # Process completed background scans and update cache
-    process_completed_scans
-    
-    # Display results immediately
+    # Display results
     display_results
+    
+    # Wait 5 seconds before next update
+    sleep 5
 done
